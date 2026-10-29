@@ -15,6 +15,16 @@ Search (HTML, plain HTTPS works, no cookie needed):
       rating title '4.8/5 - 492,573 評論', data-is-out-of-stock, #product-count.
       sr: 13 精選(default) 0 relevance 2 bestselling 1 rating 12 reviews
           4 price low->high 3 price high->low 10 newest 14 discount
+      CAVEAT (measured 2026-10-30, confirmed on the live site): some listings on
+      every sort/page render with no price at all - discontinued items
+      (data-ga-is-discontinued="True") and items iHerb blocks from purchase in this
+      region/account, shown with "無法購買" (cannot purchase) + a "查看類似商品" link
+      instead of a price span. Both are genuinely not purchasable, so the CLI drops
+      any search result with price=None (see parse_search()/cmd_search()); the
+      remaining real prices on a --sort price/price-desc page were verified already
+      in sorted order once those are removed, so no client-side re-sort is needed.
+      --min/--max/--limit/--page still apply only to the single remote page fetched
+      (see below), now over this cleaned pool.
 Catalog GraphQL (JSON, plain HTTPS; Cloudflare sometimes challenges cookieless
 bursts, a saved session's cf_clearance passes):
   POST https://graphql-catalog.app.iherb.com/?country=TW&currency=TWD&language=zh-TW
@@ -591,6 +601,12 @@ def parse_search(page):
         flags = [htmllib.unescape(f) for f in re.findall(
             r'class="product-flag [^"]*"[^>]*>(?:\s*<svg.*?</svg>)?\s*<bdi>([^<]+)</bdi>', seg, re.S)]
         oos = 'data-is-out-of-stock="true"' in seg
+        discontinued = at.get("data-ga-is-discontinued") == "True"
+        # "無法購買" (cannot purchase) block: iHerb shows this instead of a price for
+        # listings that are blocked from purchase in this region/account - no <span
+        # class="price"> is rendered at all, so price naturally parses as None. Caught
+        # here too so callers don't have to infer it from a missing price.
+        prohibited = 'class="prohibited-text' in seg
         p = num(price.group(1)) if price else None
         out.append({
             "id": int(at.get("data-product-id") or 0),
@@ -602,7 +618,9 @@ def parse_search(page):
             "discount": _strip(off.group(1)) if off else "",
             "rating": float(rt.group(1)) if rt else None,
             "reviews": int(rt.group(2).replace(",", "")) if rt else None,
-            "in_stock": not oos and at.get("data-ga-is-out-of-stock") != "True",
+            "in_stock": not oos and not discontinued and not prohibited
+            and at.get("data-ga-is-out-of-stock") != "True",
+            "purchasable": p is not None,
             "sold_30d": _strip(sold.group(1)) if sold else "",
             "flags": flags,
             "sponsored": at.get("data-sponsored") == "True",
@@ -744,15 +762,27 @@ def cmd_search(args):
     if code >= 400:
         raise ApiError(f"search: HTTP {code}")
     rows, total = parse_search(text)
+    n_before = len(rows)
+    # Discontinued listings and ones iHerb marks "無法購買" (cannot purchase - blocked
+    # from purchase in this region/account) render with no price at all, anywhere in
+    # the result list regardless of --sort. They are not purchasable, so there is
+    # nothing to show or sort by: drop them from every search result (measured live,
+    # see parse_search()). This also means --sort price/price-desc can no longer
+    # return a null price, and the remaining real prices are already in sorted order
+    # within the page (iHerb's own sort is reliable once the priceless items are
+    # removed - verified live, no client-side re-sort needed).
+    rows = [r for r in rows if r["price"] is not None]
+    n_dropped = n_before - len(rows)
     if args.min is not None:
-        rows = [r for r in rows if r["price"] is not None and r["price"] >= args.min]
+        rows = [r for r in rows if r["price"] >= args.min]
     if args.max is not None:
-        rows = [r for r in rows if r["price"] is not None and r["price"] <= args.max]
+        rows = [r for r in rows if r["price"] <= args.max]
     if args.in_stock:
         rows = [r for r in rows if r["in_stock"]]
     rows = rows[: args.limit]
     data = {"query": args.query, "page": args.page, "sort": args.sort or "featured",
-            "total": total, "count": len(rows), "items": rows, "url": url}
+            "total": total, "count": len(rows), "items": rows, "url": url,
+            "dropped_no_price": n_dropped}
     return emit(ok(data), args.json, lambda: (f"{total} results, page {args.page}\n" if total else "") + table(
         [[r["id"], clip(r["title"], 46), nt(r["price"]),
           nt(r["list_price"]) if r["list_price"] != r["price"] else "", r["discount"],

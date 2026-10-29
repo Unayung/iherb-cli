@@ -52,6 +52,16 @@ iherb raw /search?kw=zinc | raw https://checkout8.iherb.com/api/Carts/v2/cartcou
 On iHerb a variant is a separate product id. `product` lists every spec row (產品形式 / 劑量 /
 包裝數量 ...) with the id of each option.
 
+**Caveat (measured 2026-10-30):** some search results on every sort/page have no price at
+all - discontinued listings and items iHerb blocks from purchase in this region/account
+("無法購買" + a "查看類似商品" link instead of a price). Both are not purchasable, so the
+CLI drops every result with `price: null` (the response reports how many under
+`dropped_no_price`). This makes `--sort price`/`price-desc` reliable: the real prices left
+on a sorted page were verified already in ascending/descending order once the priceless
+items are removed, so no client-side re-sort is needed. `--min`/`--max`/`--limit`/`--page`
+still apply only to the single remote search page fetched (`p=<page>`, 48 items/page before
+filtering) - they are not a window over the whole catalog.
+
 ## Cart (login required)
 
 ```
