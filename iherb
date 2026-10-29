@@ -1,0 +1,1293 @@
+#!/usr/bin/env python3
+"""
+iherb - agent-native CLI for iHerb Taiwan (tw.iherb.com, TWD). No checkout.
+
+Zero dependencies (Python 3.8+ stdlib). Every command supports --json and
+returns the {ok, data|error} envelope used by the other ~/Projects CLIs.
+Exit codes: 0 ok, 1 api, 2 usage, 3 auth, 4 net/blocked.
+
+Endpoints, measured 2026-10-29 with real requests
+--------------------------------------------------
+Search (HTML, plain HTTPS works, no cookie needed):
+  GET https://tw.iherb.com/search?kw=<q>&sr=<sort>&p=<page>
+      48 `div.product-cell-container` per page: data-product-id, data-part-number,
+      data-ga-brand-name, title, span.price / span.price-olp / .percentage-off,
+      rating title '4.8/5 - 492,573 評論', data-is-out-of-stock, #product-count.
+      sr: 13 精選(default) 0 relevance 2 bestselling 1 rating 12 reviews
+          4 price low->high 3 price high->low 10 newest 14 discount
+Catalog GraphQL (JSON, plain HTTPS; Cloudflare sometimes challenges cookieless
+bursts, a saved session's cf_clearance passes):
+  POST https://graphql-catalog.app.iherb.com/?country=TW&currency=TWD&language=zh-TW
+      products(input:{ids:[...]}) { label productName brand url inventory
+      calculatedPrice{price{discount list discountPercentage} discounts{publicPCode}}
+      ugc{reviews} groupingAttributes ... }    -> product / price
+      freeShippingThreshold{amount{formatted}}  -> shipping line
+Product page (HTML): GET https://tw.iherb.com/pr/<slug>/<id>
+      Cloudflare 403 without cookies; 200 over plain HTTP with the saved session
+      cookies (cf_clearance) + the Edge User-Agent they were issued to. Holds the
+      variant tiles: div.product-grouping-row[data-testid=product-grouping-row-<名>]
+      > .attribute-tile/.thumbnail-tile [data-val, data-pid, data-is-out-of-stock].
+      On iHerb a variant IS another product id. Without a session: CDP fallback.
+Account (cookies .iHerbAuth.Cookies / .AuthServer.Cookies on .iherb.com):
+  GET  https://catalog.app.iherb.com/catalog/currentUser   200 {id,email,welcomeName,
+       rewardsCode,registrationDate} signed in, 401 not
+  POST https://checkout8.iherb.com/account/isloggedin {"requestUrl":"/"}
+       -> {status, expirationMs}
+Cart (checkout8, headers Pref:{"lac":"zh-TW","ctc":"TW","crc":"TWD","crs":"0"},
+CustomerId:<user id>; works over plain HTTP with the saved cookies):
+  GET    /api/Carts/v2/cartcount            {totalQuantity,...}
+  GET    /api/Carts/v2                      full cart: lineItems, subTotal, cartTotal..
+  POST   /api/Carts/v3/catalog/lineItems    {"lineItems":[{"productId","quantity",
+         "frequencyId":null}],"sourceModule":"ProductDetailsPage",...}  add
+  PUT    /api/Carts/v2/lineitem             {"productId","quantity"}         set qty
+  DELETE /api/Carts/v2/lineitems/products   {"lineItems":[pid],"sourceModule":"CartLists"}
+Captured from Edge's own traffic (CDP Network domain, background tab).
+Lightpanda 1.0.2 `fetch` renders the product page too, but in English (no
+locale), so it is not used. Never called: /checkout, /api/checkout*, orders.
+
+Login: never passwords/OTP. `iherb login` (default --from-browser) reads the
+cookies of the Edge on IHERB_CDP; if not signed in it opens the iHerb sign-in
+page in a background tab and polls until you sign in there. The session is
+verified with currentUser over plain HTTP before it is saved to
+~/.config/iherb/state.json (0600) or the OS keyring (--keyring; chunked, since
+secret-tool lookup returns at most 8192 bytes and the session is ~10 KB). IHERB_COOKIE
+(a Cookie header) overrides both. Cart commands use only that saved session.
+
+Unofficial. Undocumented, private API - it can break without warning.
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import html as htmllib
+import json
+import os
+import re
+import socket
+import struct
+import subprocess
+import sys
+import time
+import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
+
+VERSION = "0.1.0"
+CDP = os.environ.get("IHERB_CDP", "http://127.0.0.1:9222")
+ORIGIN = "https://tw.iherb.com"
+GQL = "https://graphql-catalog.app.iherb.com/?country=TW&currency=TWD&language=zh-TW"
+CATALOG = "https://catalog.app.iherb.com"
+CART = "https://checkout8.iherb.com"
+LOGIN_URL = CART + "/account/login?returnUrl=https%3A%2F%2Ftw.iherb.com%2F"
+PREF = '{"lac":"zh-TW","ctc":"TW","crc":"TWD","crs":"0"}'
+
+EX_OK, EX_ERR, EX_USAGE, EX_AUTH, EX_NET = 0, 1, 2, 3, 4
+DEFAULT_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+              "Chrome/156.0.0.0 Safari/537.36 Edg/156.0.0.0")
+STATE_DIR = os.path.expanduser(os.environ.get("IHERB_HOME", "~/.config/iherb"))
+STATE_FILE = os.path.join(STATE_DIR, "state.json")
+KEYRING_SERVICE = "iherb-cli"
+SORTS = {"featured": 13, "relevance": 0, "bestselling": 2, "rating": 1, "reviews": 12,
+         "price": 4, "price-desc": 3, "newest": 10, "discount": 14}
+
+
+class Net(Exception):
+    pass
+
+
+class Blocked(Net):
+    pass
+
+
+class Auth(Exception):
+    pass
+
+
+class ApiError(Exception):
+    def __init__(self, msg, detail=None):
+        super().__init__(msg)
+        self.detail = detail
+
+
+class Usage(ApiError):
+    pass
+
+
+# ---------------------------------------------------------------- envelope
+def ok(data):
+    return {"ok": True, "data": data}
+
+
+def err(msg, code=EX_ERR, **detail):
+    return {"ok": False, "error": {"message": msg, "code": code, "detail": detail or None}}
+
+
+def emit(payload, as_json, human=None):
+    if as_json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    elif payload.get("ok"):
+        print(human() if callable(human) else
+              (human if human is not None else
+               json.dumps(payload["data"], ensure_ascii=False, indent=2)))
+    else:
+        print(payload["error"]["message"], file=sys.stderr)
+    return EX_OK if payload.get("ok") else payload["error"]["code"]
+
+
+def _w(text):
+    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in str(text))
+
+
+def table(rows, headers):
+    if not rows:
+        return "(no rows)"
+    cols = list(zip(*([headers] + rows)))
+    widths = [max(_w(c) for c in col) for col in cols]
+    pad = lambda t, w: str(t) + " " * max(0, w - _w(t))  # noqa: E731
+    out = ["  ".join(pad(h, w) for h, w in zip(headers, widths)).rstrip(),
+           "  ".join("-" * w for w in widths)]
+    for r in rows:
+        out.append("  ".join(pad("" if c is None else c, w) for c, w in zip(r, widths)).rstrip())
+    return "\n".join(out)
+
+
+def clip(text, n):
+    text = (text or "").replace("\n", " ").strip()
+    if _w(text) <= n:
+        return text
+    out = ""
+    for c in text:
+        if _w(out + c) > n - 1:
+            break
+        out += c
+    return out + "…"
+
+
+def nt(v):
+    return "" if v is None else f"NT${v:,.0f}"
+
+
+def num(text):
+    """'NT$1,313' -> 1313.0"""
+    m = re.search(r"-?[\d,]+(?:\.\d+)?", text or "")
+    return float(m.group(0).replace(",", "")) if m else None
+
+
+# -------------------------------------------------------- CDP (stdlib ws)
+class WS:
+    def __init__(self, url, timeout=60):
+        if not url.startswith("ws://"):
+            raise Net(f"unsupported websocket url {url}")
+        hostport, path = url[5:].split("/", 1)
+        host, port = hostport.rsplit(":", 1)
+        try:
+            self.s = socket.create_connection((host, int(port)), timeout=timeout)
+        except OSError as e:
+            raise Net(f"cannot reach browser at {hostport}: {e}")
+        key = base64.b64encode(os.urandom(16)).decode()
+        self.s.sendall((f"GET /{path} HTTP/1.1\r\nHost: {hostport}\r\n"
+                        "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                        f"Sec-WebSocket-Key: {key}\r\n"
+                        "Sec-WebSocket-Version: 13\r\n\r\n").encode())
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = self.s.recv(4096)
+            if not chunk:
+                raise Net("websocket handshake closed")
+            buf += chunk
+        if b" 101 " not in buf.split(b"\r\n")[0]:
+            raise Net("websocket handshake refused (start Edge with --remote-allow-origins='*')")
+        self.rest = buf.split(b"\r\n\r\n", 1)[1]
+        self.n = 0
+
+    def _recv(self, n):
+        while len(self.rest) < n:
+            chunk = self.s.recv(65536)
+            if not chunk:
+                raise Net("browser closed the connection")
+            self.rest += chunk
+        out, self.rest = self.rest[:n], self.rest[n:]
+        return out
+
+    def _send(self, obj):
+        data = json.dumps(obj).encode()
+        hdr = bytearray([0x81])
+        n = len(data)
+        if n < 126:
+            hdr.append(0x80 | n)
+        elif n < 65536:
+            hdr.append(0x80 | 126)
+            hdr += struct.pack(">H", n)
+        else:
+            hdr.append(0x80 | 127)
+            hdr += struct.pack(">Q", n)
+        mask = os.urandom(4)
+        hdr += mask
+        self.s.sendall(bytes(hdr) + bytes(b ^ mask[i % 4] for i, b in enumerate(data)))
+
+    def _recv_msg(self):
+        msg = b""
+        while True:
+            b0, b1 = self._recv(2)
+            n = b1 & 0x7F
+            if n == 126:
+                n = struct.unpack(">H", self._recv(2))[0]
+            elif n == 127:
+                n = struct.unpack(">Q", self._recv(8))[0]
+            payload = self._recv(n)
+            op = b0 & 0x0F
+            if op == 8:
+                raise Net("browser closed the websocket")
+            if op in (9, 10):
+                continue
+            msg += payload
+            if b0 & 0x80:
+                return json.loads(msg)
+
+    def call(self, method, **params):
+        self.n += 1
+        i = self.n
+        self._send({"id": i, "method": method, "params": params})
+        while True:
+            m = self._recv_msg()
+            if m.get("id") == i:
+                if "error" in m:
+                    raise Net(f"{method}: {m['error'].get('message')}")
+                return m["result"]
+
+    def close(self):
+        try:
+            self.s.close()
+        except OSError:
+            pass
+
+
+def _http_json(path):
+    try:
+        with urllib.request.urlopen(CDP + path, timeout=5) as r:
+            return json.loads(r.read())
+    except OSError as e:
+        raise Net(f"no browser on {CDP} ({e}). start Edge with --remote-debugging-port=9222")
+
+
+def _set_cdp(cdp):
+    global CDP
+    if cdp:
+        CDP = cdp
+
+
+def edge_cookies():
+    """All iHerb cookies of the CDP browser (browser-level, no tab needed)."""
+    ver = _http_json("/json/version")
+    b = WS(ver["webSocketDebuggerUrl"])
+    try:
+        cks = b.call("Storage.getCookies")["cookies"]
+    finally:
+        b.close()
+    keep = [{"name": c["name"], "value": c["value"], "domain": c["domain"]}
+            for c in cks if c["domain"].lstrip(".") == "iherb.com"
+            or c["domain"].endswith(".iherb.com")]
+    return keep, ver.get("User-Agent")
+
+
+class Browser:
+    """One background tab on tw.iherb.com, closed on exit. Never focused."""
+
+    def __init__(self, debug=False, url=ORIGIN + "/", wait=True):
+        self.debug = debug
+        self.ver = _http_json("/json/version")
+        self.b = WS(self.ver["webSocketDebuggerUrl"])
+        self.tid = self.b.call("Target.createTarget", url=url, background=True)["targetId"]
+        try:
+            tgt = next(x for x in _http_json("/json/list") if x["id"] == self.tid)
+            self.p = WS(tgt["webSocketDebuggerUrl"], timeout=90)
+            if wait:
+                self._wait_ready(urllib.parse.urlparse(url).netloc)
+        except BaseException:
+            self.close()
+            raise
+
+    def _wait_ready(self, host, limit=30):
+        t0 = time.time()
+        while time.time() - t0 < limit:
+            r = self.eval("location.host + '|' + document.readyState + '|' + document.title")
+            if r and r.startswith(host) and "|loading|" not in r and "Just a moment" not in r:
+                return
+            time.sleep(0.7)
+        raise Net(f"{host} did not load in the background tab (Cloudflare check?)")
+
+    def eval(self, expr):
+        r = self.p.call("Runtime.evaluate", expression=expr, awaitPromise=True, returnByValue=True)
+        if r.get("exceptionDetails"):
+            raise ApiError("page script failed: " + str(
+                r["exceptionDetails"].get("exception", {}).get("description")
+                or r["exceptionDetails"].get("text")))
+        return r.get("result", {}).get("value")
+
+    def fetch(self, method, url, body=None, headers=None):
+        opts = {"method": method, "credentials": "include", "headers": headers or {}}
+        if body is not None:
+            opts["body"] = body
+        js = ("fetch(%s,%s).then(async r=>({http:r.status,text:await r.text()}))"
+              % (json.dumps(url), json.dumps(opts)))
+        r = self.eval(js)
+        return r["http"], r["text"]
+
+    def close(self):
+        try:
+            self.b.call("Target.closeTarget", targetId=self.tid)
+        except Exception:
+            pass
+        for w in (getattr(self, "p", None), getattr(self, "b", None)):
+            if w:
+                w.close()
+
+
+# ------------------------------------------------------------------ state
+def _keyring(op, secret=None, acct="default"):
+    try:
+        if sys.platform == "darwin":
+            cmd = {"set": ["security", "add-generic-password", "-U", "-a", acct,
+                           "-s", KEYRING_SERVICE, "-w", secret],
+                   "get": ["security", "find-generic-password", "-a", acct, "-s", KEYRING_SERVICE, "-w"],
+                   "del": ["security", "delete-generic-password", "-a", acct, "-s", KEYRING_SERVICE]}[op]
+            r = subprocess.run(cmd, capture_output=True, text=True)
+        else:
+            base = ["service", KEYRING_SERVICE, "account", acct]
+            cmd = {"set": ["secret-tool", "store", "--label=iherb-cli"] + base,
+                   "get": ["secret-tool", "lookup"] + base,
+                   "del": ["secret-tool", "clear"] + base}[op]
+            r = subprocess.run(cmd, input=secret if op == "set" else None,
+                               capture_output=True, text=True)
+    except FileNotFoundError:
+        raise Auth("no keyring tool (macOS `security` / Linux `secret-tool`)")
+    if op == "get":
+        return r.stdout.strip() if r.returncode == 0 else None
+    if op == "set" and r.returncode != 0:
+        raise Auth("keyring write failed: " + r.stderr.strip())
+    return True
+
+
+# secret-tool lookup returns at most 8192 bytes (measured), iHerb cookies are ~10 KB
+KR_CHUNK = 4000
+
+
+def keyring_save(cookies):
+    blob = json.dumps(cookies, separators=(",", ":"))
+    parts = [blob[i:i + KR_CHUNK] for i in range(0, len(blob), KR_CHUNK)]
+    for i, part in enumerate(parts):
+        _keyring("set", part, f"default.{i}")
+    return len(parts)
+
+
+def keyring_load(n):
+    parts = [_keyring("get", acct=f"default.{i}") for i in range(n or 0)]
+    if not n or any(p is None for p in parts):
+        raise Auth("saved keyring session is missing - run `iherb login --keyring`")
+    try:
+        return json.loads("".join(parts))
+    except ValueError:
+        raise Auth("saved keyring session is corrupt - run `iherb login --keyring`")
+
+
+def keyring_clear(n):
+    for i in range(max(n or 0, 1)):
+        _keyring("del", acct=f"default.{i}")
+    _keyring("del")  # pre-chunking single entry, if any
+
+
+def header_to_cookies(header):
+    return [{"name": p.split("=", 1)[0], "value": p.split("=", 1)[1], "domain": ".iherb.com"}
+            for p in header.split("; ") if "=" in p]
+
+
+def load_state():
+    try:
+        with open(STATE_FILE, encoding="utf-8") as f:
+            st = json.load(f)
+    except FileNotFoundError:
+        st = {}
+    except (OSError, ValueError) as e:
+        raise ApiError(f"state file unreadable: {e}")
+    if os.environ.get("IHERB_COOKIE"):
+        st["cookies"], st["source"] = header_to_cookies(clean_cookie(os.environ["IHERB_COOKIE"])), "env"
+    elif st.get("cookie_in_keyring"):
+        try:
+            st["cookies"] = keyring_load(st.get("keyring_parts"))
+        except Auth as e:
+            st["cookies"], st["keyring_error"] = [], str(e)
+        st["source"] = "keyring"
+    elif st.get("cookies"):
+        st["source"] = "file"
+    return st
+
+
+def save_state(st):
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    out = {k: v for k, v in st.items() if k not in ("source", "keyring_error")}
+    if out.get("cookie_in_keyring"):
+        out.pop("cookies", None)
+    tmp = STATE_FILE + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(out, f, ensure_ascii=False, indent=2)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, STATE_FILE)
+
+
+def cookie_for(cookies, url):
+    host = urllib.parse.urlparse(url).hostname or ""
+    seen, parts = set(), []
+    for c in cookies or []:
+        d = c.get("domain") or ".iherb.com"
+        hit = host == d.lstrip(".") or (d.startswith(".") and host.endswith(d))
+        if hit and c["name"] not in seen:
+            seen.add(c["name"])
+            parts.append(f"{c['name']}={c['value']}")
+    return "; ".join(parts)
+
+
+# -------------------------------------------------------------- transport
+def is_challenge(code, text):
+    head = (text or "")[:3000]
+    return code in (403, 429, 503) and ("<" in head[:200] or not head) or "Just a moment" in head \
+        or "challenge-platform" in head or "px-captcha" in head
+
+
+class Http:
+    """Direct HTTPS. Sends the saved session cookies for the target host."""
+
+    def __init__(self, st, debug=False):
+        self.st, self.debug = st, debug
+        self.ua = os.environ.get("IHERB_UA") or st.get("ua") or DEFAULT_UA
+
+    def fetch(self, method, url, body=None, headers=None):
+        h = {"User-Agent": self.ua, "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
+             "Origin": ORIGIN, "Referer": ORIGIN + "/"}
+        h.update(headers or {})
+        ck = cookie_for(self.st.get("cookies"), url)
+        if ck:
+            h["Cookie"] = ck
+        data = body.encode() if isinstance(body, str) else body
+        if self.debug:
+            print(f"> {method} {url} {(body or '')[:300]}", file=sys.stderr)
+        req = urllib.request.Request(url, data=data, headers=h, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=25) as r:
+                code, text = r.status, r.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as e:
+            code, text = e.code, e.read().decode("utf-8", "replace")
+        except OSError as e:
+            raise Net(f"{urllib.parse.urlparse(url).netloc}: {e}")
+        if self.debug:
+            print(f"< {code} {text[:300]}", file=sys.stderr)
+        return code, text
+
+
+class Client:
+    """HTTP first; anonymous reads fall back to a CDP background tab on a bot
+    wall. Logged-in calls (account, cart) only ever use the saved session."""
+
+    def __init__(self, args, st=None):
+        self.args = args
+        self.st = st if st is not None else load_state()
+        self.http = Http(self.st, getattr(args, "debug", False))
+        self.br = None
+
+    def _browser(self):
+        if not self.br:
+            self.br = Browser(self.args.debug)
+        return self.br
+
+    def fetch(self, method, url, body=None, headers=None, session=False):
+        via = getattr(self.args, "via", "auto")
+        if session and not self.st.get("cookies"):
+            raise Auth("not signed in - run `iherb login`")
+        if via != "browser" or session:
+            code, text = self.http.fetch(method, url, body, headers)
+            if is_challenge(code, text):
+                time.sleep(3)  # Cloudflare often lets the next calm request through
+                code, text = self.http.fetch(method, url, body, headers)
+            if not is_challenge(code, text):
+                return code, text
+            if via == "http" or session:
+                raise Blocked(f"{urllib.parse.urlparse(url).netloc}: bot wall (HTTP {code}). "
+                              + ("run `iherb login` again to refresh cf_clearance"
+                                 if session else "retry later, or use --via browser"))
+            print(f"note: HTTP blocked ({code}), retrying in a background Edge tab", file=sys.stderr)
+        return self._browser().fetch(method, url, body, headers)
+
+    def json(self, method, url, body=None, headers=None, session=False, what=None):
+        h = {"Accept": "application/json", "Content-Type": "application/json"}
+        h.update(headers or {})
+        code, text = self.fetch(method, url, json.dumps(body) if body is not None else None, h, session)
+        what = what or urllib.parse.urlparse(url).path
+        if code == 401:
+            raise Auth(f"{what}: not signed in (HTTP 401) - run `iherb login`")
+        try:
+            d = json.loads(text) if text.strip() else None
+        except ValueError:
+            raise ApiError(f"{what}: non-JSON reply (HTTP {code})", {"http": code})
+        if code >= 400:
+            raise ApiError(f"{what}: HTTP {code} {str(d)[:300]}", {"http": code, "reply": d})
+        return d
+
+    def gql(self, query, variables=None, name=None):
+        d = self.json("POST", GQL, {"operationName": name, "query": query, "variables": variables or {}},
+                      what="graphql " + (name or ""))
+        if d.get("errors") and not d.get("data"):
+            raise ApiError("graphql: " + "; ".join(e.get("message", "") for e in d["errors"])[:400])
+        return d.get("data") or {}
+
+    def cart_api(self, method, path, body=None):
+        h = {"Pref": PREF}
+        uid = (self.st.get("user") or {}).get("id")
+        if uid:
+            h["CustomerId"] = uid
+        return self.json(method, CART + path, body, h, session=True, what=path)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        if self.br:
+            self.br.close()
+
+
+# --------------------------------------------------------------- parsing
+def product_id(ref):
+    ref = str(ref).strip()
+    if re.fullmatch(r"\d+", ref):
+        return int(ref)
+    m = re.search(r"/pr/(?:[^/?#]+/)?(\d+)", ref) or re.search(r"(?:pid_|/)(\d{2,})(?:[/?#]|$)", ref)
+    if not m:
+        raise Usage(f"not an iHerb product id or /pr/... URL: {ref!r}")
+    return int(m.group(1))
+
+
+def _attrs(tag):
+    return {k: htmllib.unescape(v) for k, v in re.findall(r'([\w:-]+)="([^"]*)"', tag)}
+
+
+def _strip(s):
+    return htmllib.unescape(re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", s or ""))).strip()
+
+
+def parse_search(page):
+    cells = [m.start() for m in re.finditer(r'<div\s+class="product-cell-container', page)]
+    out = []
+    for a, b in zip(cells, cells[1:] + [len(page)]):
+        seg = page[a:b]
+        link = re.search(r'<a [^>]*class="absolute-link product-link"[^>]*>', seg)
+        if not link:
+            continue
+        at = _attrs(link.group(0))
+        price = re.search(r'<span class="price[^"]*">\s*<bdi>([^<]+)</bdi>', seg)
+        olp = re.search(r'<span class="price-olp">\s*<bdi>([^<]+)</bdi>', seg)
+        off = re.search(r'<span class="percentage-off">\s*<bdi>([^<]+)</bdi>', seg)
+        rt = re.search(r"title='([\d.]+)/5 - ([\d,]+)", seg)
+        sold = re.search(r'class="recent-activity-message-wrapper">(.*?)</div>', seg, re.S)
+        flags = [htmllib.unescape(f) for f in re.findall(
+            r'class="product-flag [^"]*"[^>]*>(?:\s*<svg.*?</svg>)?\s*<bdi>([^<]+)</bdi>', seg, re.S)]
+        oos = 'data-is-out-of-stock="true"' in seg
+        p = num(price.group(1)) if price else None
+        out.append({
+            "id": int(at.get("data-product-id") or 0),
+            "title": at.get("title"),
+            "brand": at.get("data-ga-brand-name"),
+            "part_number": at.get("data-part-number"),
+            "price": p,
+            "list_price": num(olp.group(1)) if olp else p,
+            "discount": _strip(off.group(1)) if off else "",
+            "rating": float(rt.group(1)) if rt else None,
+            "reviews": int(rt.group(2).replace(",", "")) if rt else None,
+            "in_stock": not oos and at.get("data-ga-is-out-of-stock") != "True",
+            "sold_30d": _strip(sold.group(1)) if sold else "",
+            "flags": flags,
+            "sponsored": at.get("data-sponsored") == "True",
+            "url": at.get("href"),
+        })
+    total = re.search(r'id="product-count"[^>]*data-count="(\d+)"', page)
+    return out, int(total.group(1)) if total else None
+
+
+def parse_variants(page):
+    groups = []
+    rows = list(re.finditer(r'<div\s+class="product-grouping-row"\s+data-testid="product-grouping-row-([^"]+)"', page))
+    for i, m in enumerate(rows):
+        seg = page[m.start(): rows[i + 1].start() if i + 1 < len(rows) else m.start() + 60000]
+        cur = re.search(r'data-current-item="([^"]*)"', seg)
+        opts, seen = [], set()
+        for t in re.finditer(r'<div\s+class="(?:attribute|thumbnail)-tile [^"]*"[^>]*>', seg):
+            a = _attrs(t.group(0))
+            if not a.get("data-pid") or a["data-pid"] in seen:
+                continue
+            seen.add(a["data-pid"])
+            cls = a.get("class", "")
+            opts.append({"value": a.get("data-val"), "id": int(a["data-pid"]),
+                         "selected": "combo-selected" in cls or a.get("aria-selected") == "true",
+                         "sold_out": a.get("data-is-out-of-stock") == "True",
+                         "note": (a.get("aria-label") or "").replace(a.get("data-val") or "", "", 1).strip(),
+                         "url": a.get("data-url")})
+        groups.append({"name": htmllib.unescape(m.group(1)),
+                       "current": htmllib.unescape(cur.group(1)) if cur else None, "options": opts})
+    return groups
+
+
+PRODUCT_Q = """query P($ids:[Int!]){products(input:{ids:$ids}){
+ id label(withBrand:true) productName packageQuantity partNumber url
+ brand{name} ugc{reviews{averageRating count}} hidePrice isAvailableToPurchase
+ inventory{hasStock stock} specification{potency} productFlags{displayName}
+ calculatedPrice(input:{}){price{discount{value formatted} list{value formatted}
+   discountPercentage discountMessage appliedPromoCodeMessage}
+   discounts{publicPCode{promoCode message discountPercentage} bogo{title}}}
+ groupingAttributes{attributeValuePair(isDisabled:false){value{id label}}}
+}}"""
+SHIP_Q = """query S($id:Int!){freeShippingThreshold(input:{productId:$id}){amount{formatted value}}}"""
+
+
+def parse_product(p):
+    cp = p.get("calculatedPrice") or {}
+    pr = cp.get("price") or {}
+    disc = cp.get("discounts") or {}
+    pc = disc.get("publicPCode") or {}
+    inv = p.get("inventory") or {}
+    rev = (p.get("ugc") or {}).get("reviews") or {}
+    promos = [x for x in [pr.get("discountMessage"), pr.get("appliedPromoCodeMessage"),
+                          pc.get("message"), (disc.get("bogo") or {}).get("title")] if x]
+    return {
+        "id": p.get("id"), "title": p.get("label"), "name": p.get("productName"),
+        "brand": (p.get("brand") or {}).get("name"), "part_number": p.get("partNumber"),
+        "package": p.get("packageQuantity"),
+        "potency": (p.get("specification") or {}).get("potency"),
+        "price": (pr.get("discount") or {}).get("value"),
+        "list_price": (pr.get("list") or {}).get("value"),
+        "discount_pct": pr.get("discountPercentage") or 0,
+        "currency": "TWD",
+        "promo_code": pc.get("promoCode"), "promo_pct": pc.get("discountPercentage"),
+        "promos": promos,
+        "in_stock": bool(inv.get("hasStock")), "stock": inv.get("stock"),
+        "purchasable": p.get("isAvailableToPurchase"),
+        "rating": rev.get("averageRating"), "reviews": rev.get("count"),
+        "flags": [f.get("displayName") for f in p.get("productFlags") or []],
+        "specs": [((x.get("value") or {}).get("label")) for x in
+                  ((p.get("groupingAttributes") or {}).get("attributeValuePair") or [])],
+        "seller": "iHerb",
+        "url": p.get("url"),
+    }
+
+
+def get_products(cl, ids):
+    d = cl.gql(PRODUCT_Q, {"ids": ids}, "P")
+    got = {p["id"]: parse_product(p) for p in d.get("products") or [] if p}
+    return got
+
+
+def get_variants(cl, url):
+    code, text = cl.fetch("GET", url, headers={"Accept": "text/html"})
+    if code >= 400:
+        raise ApiError(f"product page HTTP {code}")
+    return parse_variants(text)
+
+
+# --------------------------------------------------------------- commands
+def cmd_doctor(args):
+    checks = []
+    st = load_state()
+    checks.append(["state", "ok" if os.path.exists(STATE_FILE) else "-", STATE_FILE])
+    cl = Client(argparse.Namespace(via="http", debug=args.debug), st)
+    try:
+        code, text = cl.fetch("GET", ORIGIN + "/search?kw=vitamin", headers={"Accept": "text/html"})
+        n = len(parse_search(text)[0])
+        checks.append(["search", "ok" if n else "FAIL", f"tw.iherb.com/search over HTTP: {n} items"])
+    except (Net, ApiError) as e:
+        checks.append(["search", "FAIL", str(e)])
+    try:
+        p = get_products(cl, [61864]).get(61864)
+        checks.append(["catalog", "ok", f"graphql over HTTP: 61864 {nt(p['price'])}"])
+    except (Net, ApiError) as e:
+        checks.append(["catalog", "FAIL", str(e)])
+    try:
+        ver = _http_json("/json/version")
+        checks.append(["cdp", "ok", f"{CDP} {ver.get('Browser')} (fallback + login)"])
+    except Net:
+        checks.append(["cdp", "-", f"no browser on {CDP} (needed for login --from-browser / fallback)"])
+    if st.get("cookies"):
+        try:
+            u = current_user(cl)
+            checks.append(["login", "ok", f"{u.get('email')} via {st.get('source')} (HTTP)"])
+            c = cl.cart_api("GET", "/api/Carts/v2/cartcount")
+            checks.append(["cart", "ok", f"{c.get('totalQuantity')} item(s) in cart"])
+        except (Auth, ApiError, Net) as e:
+            checks.append(["login", "FAIL", f"saved session rejected: {e}"])
+    else:
+        checks.append(["login", "-", "not signed in (search/product/price work; cart needs login)"])
+    bad = any(c[1] == "FAIL" for c in checks)
+    payload = err("doctor found problems", EX_NET, checks=checks) if bad else ok({"checks": checks})
+    if bad and not args.json:
+        print(table(checks, ["check", "state", "detail"]))
+    return emit(payload, args.json, lambda: table(checks, ["check", "state", "detail"]))
+
+
+def cmd_search(args):
+    if args.limit < 1 or args.page < 1:
+        raise Usage("--limit and --page must be >= 1")
+    q = {"kw": args.query}
+    if args.sort:
+        q["sr"] = SORTS[args.sort]
+    if args.page > 1:
+        q["p"] = args.page
+    url = ORIGIN + "/search?" + urllib.parse.urlencode(q)
+    with Client(args) as cl:
+        code, text = cl.fetch("GET", url, headers={"Accept": "text/html"})
+    if code >= 400:
+        raise ApiError(f"search: HTTP {code}")
+    rows, total = parse_search(text)
+    if args.min is not None:
+        rows = [r for r in rows if r["price"] is not None and r["price"] >= args.min]
+    if args.max is not None:
+        rows = [r for r in rows if r["price"] is not None and r["price"] <= args.max]
+    if args.in_stock:
+        rows = [r for r in rows if r["in_stock"]]
+    rows = rows[: args.limit]
+    data = {"query": args.query, "page": args.page, "sort": args.sort or "featured",
+            "total": total, "count": len(rows), "items": rows, "url": url}
+    return emit(ok(data), args.json, lambda: (f"{total} results, page {args.page}\n" if total else "") + table(
+        [[r["id"], clip(r["title"], 46), nt(r["price"]),
+          nt(r["list_price"]) if r["list_price"] != r["price"] else "", r["discount"],
+          f"{r['rating']}/{r['reviews']:,}" if r["rating"] else "", "" if r["in_stock"] else "缺貨"]
+         for r in rows], ["id", "title", "price", "orig", "off", "rating", "stock"]))
+
+
+def _product_human(p):
+    out = [p["title"] or "", p["url"] or "",
+           f"id {p['id']}  part {p['part_number']}  brand {p['brand']}  seller {p['seller']}",
+           f"price {nt(p['price'])}" + (f"  (list {nt(p['list_price'])}, -{p['discount_pct']}%)"
+                                        if p["list_price"] and p["list_price"] != p["price"] else ""),
+           f"stock {'in stock' if p['in_stock'] else 'OUT OF STOCK'}"
+           + (f" ({p['stock']})" if p.get("stock") is not None else ""),
+           f"rating {p['rating']} ({p['reviews']:,} reviews)" if p["rating"] else "rating -"]
+    for x in p["promos"]:
+        out.append(f"promo {x}")
+    if p.get("shipping"):
+        out.append(f"shipping {p['shipping']}")
+    if p["flags"]:
+        out.append("flags " + " / ".join(p["flags"]))
+    if p.get("variants"):
+        out.append("")
+        for g in p["variants"]:
+            out.append(f"[{g['name']}] current: {g['current']}")
+            for o in g["options"]:
+                out.append(f"  {'*' if o['selected'] else '-'} {o['value']}  id {o['id']}"
+                           + ("  (sold out)" if o["sold_out"] else "")
+                           + (f"  ({o['note']})" if o["note"] and not o["selected"] else ""))
+    elif p.get("variants_note"):
+        out.append("variants: " + p["variants_note"])
+    return "\n".join(out)
+
+
+def cmd_product(args):
+    pid = product_id(args.product)
+    with Client(args) as cl:
+        p = get_products(cl, [pid]).get(pid)
+        if not p:
+            raise ApiError(f"no iHerb product {pid}")
+        try:
+            s = cl.gql(SHIP_Q, {"id": pid}, "S").get("freeShippingThreshold") or {}
+            amt = (s.get("amount") or {}).get("formatted")
+            p["shipping"] = f"ships from iHerb; free shipping over {amt}" if amt else "ships from iHerb"
+        except (ApiError, Net):
+            p["shipping"] = None
+        if not args.no_variants:
+            try:
+                p["variants"] = get_variants(cl, p["url"])
+            except (Net, ApiError) as e:
+                p["variants"], p["variants_note"] = [], f"unavailable ({e})"
+    return emit(ok(p), args.json, lambda: _product_human(p))
+
+
+def cmd_price(args):
+    ids = [product_id(x) for x in args.products]
+    with Client(args) as cl:
+        got = get_products(cl, ids)
+    rows = []
+    for i in ids:
+        p = got.get(i)
+        rows.append({"id": i, "found": bool(p), **({k: p[k] for k in (
+            "title", "price", "list_price", "discount_pct", "promo_code", "promo_pct",
+            "in_stock", "url")} if p else {}), "checked_at": int(time.time())})
+    return emit(ok(rows), args.json, lambda: table(
+        [[r["id"], clip(r.get("title"), 46), nt(r.get("price")),
+          nt(r.get("list_price")) if r.get("list_price") != r.get("price") else "",
+          f"{r.get('promo_code')} -{r.get('promo_pct')}%" if r.get("promo_code") else "",
+          ("in stock" if r.get("in_stock") else "OUT") if r["found"] else "NOT FOUND"] for r in rows],
+        ["id", "title", "price", "orig", "promo code", "stock"]))
+
+
+RAW_HOSTS = {"tw.iherb.com", "catalog.app.iherb.com", "checkout8.iherb.com"}
+
+
+def cmd_raw(args):
+    url = args.path if args.path.startswith("http") else ORIGIN + "/" + args.path.lstrip("/")
+    u = urllib.parse.urlparse(url)
+    if u.hostname not in RAW_HOSTS:
+        raise Usage(f"raw only talks to {', '.join(sorted(RAW_HOSTS))}")
+    if re.search(r"checkout|order|payment", u.path, re.I) and not u.path.startswith("/api/Carts/v2"):
+        raise Usage("raw refuses checkout/order/payment paths")
+    with Client(args) as cl:
+        h = {"Pref": PREF} if u.hostname == "checkout8.iherb.com" else {}
+        uid = (cl.st.get("user") or {}).get("id")
+        if uid and u.hostname == "checkout8.iherb.com":
+            h["CustomerId"] = uid
+        code, text = cl.fetch("GET", url, headers=h)
+    try:
+        body = json.loads(text)
+    except ValueError:
+        body = text[:20000]
+    return emit(ok({"http": code, "url": url, "body": body}), True)
+
+
+# ---------------------------------------------------------------- session
+COOKIE_PAIR = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+=[\x21-\x7e]*$")
+
+
+def clean_cookie(raw):
+    raw = (raw or "").strip()
+    if raw.lower().startswith("cookie:"):
+        raw = raw.split(":", 1)[1].strip()
+    pairs = [p.strip() for p in raw.replace("\n", ";").split(";")]
+    good = [p for p in pairs if p and COOKIE_PAIR.match(p)]
+    bad = [p for p in pairs if p and not COOKIE_PAIR.match(p)]
+    if not any(p.startswith((".iHerbAuth.Cookies=", ".AuthServer.Cookies=")) for p in good):
+        preview = raw[:40].encode("ascii", "replace").decode()
+        raise Auth("that does not look like a signed-in iHerb Cookie header (no .iHerbAuth.Cookies; "
+                   f"starts with {preview!r}). DevTools > Network > a catalog.app.iherb.com request > "
+                   "Request Headers > copy the value of `Cookie`")
+    if bad:
+        print(f"note: dropped {len(bad)} malformed cookie part(s)", file=sys.stderr)
+    return "; ".join(good)
+
+
+def current_user(cl):
+    d = cl.json("GET", CATALOG + "/catalog/currentUser", session=True, what="currentUser")
+    if not d or not d.get("id"):
+        raise Auth("currentUser returned no user - not signed in")
+    return d
+
+
+def _verify(cookies, ua, debug):
+    st = {"cookies": cookies, "ua": ua}
+    cl = Client(argparse.Namespace(via="http", debug=debug), st)
+    try:
+        u = current_user(cl)
+    except (Auth, ApiError) as e:
+        raise Auth(f"that session is not signed in to iHerb ({e})")
+    try:
+        li = cl.json("POST", CART + "/account/isloggedin", {"requestUrl": "/"}, session=True)
+    except (ApiError, Net):
+        li = {}
+    return u, li
+
+
+def _clipboard():
+    for cmd in (["wl-paste", "-n"], ["pbpaste"], ["xclip", "-o", "-selection", "clipboard"]):
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            continue
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout.strip()
+    raise Auth("clipboard is empty or no clipboard tool (wl-paste / pbpaste / xclip)")
+
+
+def _read_cookie_tty():
+    """Raw tty read: the Linux line editor caps a line at 4095 bytes."""
+    import termios
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    new = termios.tcgetattr(fd)
+    new[3] &= ~(termios.ICANON | termios.ECHO)
+    new[6][termios.VMIN], new[6][termios.VTIME] = 1, 0
+    print("paste the Cookie header, then press Enter (input hidden):", file=sys.stderr)
+    buf = bytearray()
+    try:
+        termios.tcsetattr(fd, termios.TCSANOW, new)
+        while True:
+            ch = os.read(fd, 65536)
+            if not ch:
+                break
+            if b"\x03" in ch:
+                raise KeyboardInterrupt
+            buf += ch
+            if b"\r" in ch or b"\n" in ch:
+                break
+    finally:
+        termios.tcsetattr(fd, termios.TCSANOW, old)
+        print(file=sys.stderr)
+    return buf.decode("utf-8", "replace").splitlines()[0] if buf else ""
+
+
+def _signed_in(cookies):
+    return any(c["name"] == ".iHerbAuth.Cookies" for c in cookies)
+
+
+def login_from_browser(args):
+    _set_cdp(args.cdp)
+    cookies, ua = edge_cookies()
+    if _signed_in(cookies):
+        try:
+            return cookies, ua, _verify(cookies, ua, args.debug)
+        except Auth:
+            pass
+    br = Browser(args.debug, LOGIN_URL, wait=False)
+    try:
+        print(f"Sign in to iHerb in the new background tab of the browser on {CDP} "
+              f"(switch to it yourself). Waiting up to {args.wait}s...", file=sys.stderr)
+        t0 = time.time()
+        while time.time() - t0 < args.wait:
+            time.sleep(4)
+            cookies, ua = edge_cookies()
+            if _signed_in(cookies):
+                try:
+                    return cookies, ua, _verify(cookies, ua, args.debug)
+                except Auth:
+                    pass
+        raise Auth(f"not signed in after {args.wait}s; run `iherb login` again")
+    finally:
+        br.close()
+
+
+def cmd_login(args):
+    if args.from_clipboard or args.cookie_stdin:
+        raw = _clipboard() if args.from_clipboard else \
+            (_read_cookie_tty() if sys.stdin.isatty() else sys.stdin.read())
+        cookies = header_to_cookies(clean_cookie(raw))
+        ua = os.environ.get("IHERB_UA") or DEFAULT_UA
+        u, li = _verify(cookies, ua, args.debug)
+        src = "clipboard" if args.from_clipboard else "stdin"
+    else:
+        cookies, ua, (u, li) = login_from_browser(args)
+        src = f"browser {CDP}"
+    st = load_state()
+    st.pop("source", None)
+    exp = int(li["expirationMs"] / 1000) if li.get("expirationMs") else None
+    st.update(cookies=cookies, ua=ua, cookie_in_keyring=bool(args.keyring),
+              user={"id": u.get("id"), "email": u.get("email"), "name": u.get("welcomeName")},
+              logged_in_at=int(time.time()), exp=exp, login_source=src)
+    if st.get("keyring_parts"):
+        keyring_clear(st["keyring_parts"])
+    st.pop("keyring_parts", None)
+    st.pop("keyring_error", None)
+    if args.keyring:
+        st["keyring_parts"] = keyring_save(cookies)
+        if keyring_load(st["keyring_parts"]) != cookies:
+            raise Auth("keyring did not return the session it was given; use the state file")
+    save_state(st)
+    out = {"user": st["user"], "stored": "keyring" if args.keyring else STATE_FILE,
+           "expires": exp, "cookies": len(cookies)}
+    return emit(ok(out), args.json, lambda: f"signed in as {u.get('welcomeName') or ''} <{u.get('email')}>; "
+                f"session ({len(cookies)} cookies) saved to {out['stored']}"
+                + (f", expires {time.strftime('%Y-%m-%d %H:%M', time.localtime(exp))}" if exp else ""))
+
+
+def cmd_logout(args):
+    st = load_state()
+    if st.get("cookie_in_keyring"):
+        keyring_clear(st.get("keyring_parts"))
+    for k in ("cookies", "cookie_in_keyring", "keyring_parts", "keyring_error", "user",
+              "logged_in_at", "exp", "login_source", "source", "ua"):
+        st.pop(k, None)
+    save_state(st)
+    return emit(ok({"logged_out": True}), args.json, "session removed")
+
+
+def cmd_whoami(args):
+    st = load_state()
+    if not st.get("cookies"):
+        raise Auth(st.get("keyring_error") or "not signed in - run `iherb login`")
+    cl = Client(argparse.Namespace(via="http", debug=args.debug), st)
+    u = current_user(cl)
+    out = {"id": u.get("id"), "email": u.get("email"), "name": u.get("welcomeName"),
+           "first_name": u.get("firstName"), "last_name": u.get("lastName"),
+           "rewards_code": u.get("rewardsCode"),
+           "member_since": (u.get("registrationDate") or "")[:10],
+           "source": st.get("source"), "transport": "http", "expires": st.get("exp")}
+    return emit(ok(out), args.json, lambda: (
+        f"{out['name'] or ''} <{out['email']}>\n"
+        f"member since {out['member_since']}  rewards code {out['rewards_code']}\n"
+        f"session via {out['source']} (verified over plain HTTP)"
+        + (f", expires {time.strftime('%Y-%m-%d', time.localtime(out['expires']))}" if out["expires"] else "")))
+
+
+# ------------------------------------------------------------------- cart
+def parse_cart(d):
+    lines = []
+    for n, x in enumerate(d.get("lineItems") or [], 1):
+        pi = x.get("productInfo") or {}
+        name = pi.get("displayName")
+        lines.append({
+            "line": n, "id": x.get("productId"),
+            "title": f"{pi['brandName']}, {name}" if pi.get("brandName") and name else name,
+            "part_number": pi.get("partNumber"),
+            "spec": None,
+            "quantity": x.get("quantity"),
+            "unit_price": x.get("priceRawAmount"), "unit_price_text": x.get("price"),
+            "list_price": x.get("listPriceRawAmount"),
+            "subtotal": x.get("adjustedTotalRawAmount") or
+            ((x.get("priceRawAmount") or 0) * (x.get("quantity") or 0)),
+            "subtotal_text": x.get("adjustedTotal") or x.get("total"),
+            "in_stock": not x.get("isOutOfStock"), "max_qty": x.get("maxAvailableQuantity"),
+            "url": pi.get("productUrl") or (f"{ORIGIN}/pr/x/{x.get('productId')}" if x.get("productId") else None),
+        })
+    return {"count": d.get("cartQuantity"), "lines": lines,
+            "subtotal": d.get("subTotal"), "discount": d.get("totalDiscount") or "",
+            "shipping": d.get("shippingTotal"), "total": d.get("cartTotal"),
+            "total_amount": d.get("orderTotalAmount"), "promo_code": d.get("promoCode"),
+            "errors": d.get("cartErrors") or []}
+
+
+SPEC_Q = ("query CartWeb_GetProductsGroupingAttributes($ids:[Int!]!){products(input:{ids:$ids}){id "
+          "groupingAttributes{attributeValuePair(isDisabled:false){value{id label}}}}}")
+
+
+def read_cart(cl):
+    c = parse_cart(cl.cart_api("GET", "/api/Carts/v2"))
+    ids = [x["id"] for x in c["lines"] if x["id"]]
+    if ids:  # spec labels, the same query the cart page runs; cosmetic, so never fatal
+        try:
+            d = cl.gql(SPEC_Q, {"ids": ids}, "CartWeb_GetProductsGroupingAttributes")
+            spec = {p["id"]: " / ".join((v.get("value") or {}).get("label") or "" for v in
+                                        ((p.get("groupingAttributes") or {}).get("attributeValuePair") or []))
+                    for p in d.get("products") or [] if p}
+            for x in c["lines"]:
+                x["spec"] = spec.get(x["id"]) or None
+        except (ApiError, Net):
+            pass
+    return c
+
+
+def _cart_human(c):
+    t = table([[x["line"], x["id"], clip(x["title"], 44), x["spec"] or "", x["quantity"],
+                x["unit_price_text"] or nt(x["unit_price"]), nt(x["subtotal"]),
+                "" if x["in_stock"] else "缺貨"] for x in c["lines"]],
+              ["#", "id", "item", "spec", "qty", "each", "subtotal", ""]) if c["lines"] else "(cart is empty)"
+    return (t + f"\n\n{c['count']} item(s)  subtotal {c['subtotal']}"
+            + (f"  discount {c['discount']}" if c["discount"] else "")
+            + f"  shipping {c['shipping']}  total {c['total']}")
+
+
+def find_line(c, ref):
+    s = str(ref).strip()
+    if re.fullmatch(r"\d+", s):
+        n = int(s)
+        hit = [x for x in c["lines"] if x["id"] == n]
+        if hit:
+            return hit[0]
+        if 1 <= n <= len(c["lines"]):
+            return c["lines"][n - 1]
+    else:
+        pid = product_id(s)
+        hit = [x for x in c["lines"] if x["id"] == pid]
+        if hit:
+            return hit[0]
+    raise ApiError(f"nothing in the cart matches {ref!r}",
+                   {"cart": [f"#{x['line']} {x['id']} {x['title']}" for x in c["lines"]]})
+
+
+def pick_spec(cl, pid, specs):
+    """--spec TEXT -> the variant product id (iHerb variants are separate products)."""
+    for want in specs:
+        p = get_products(cl, [pid]).get(pid)
+        groups = get_variants(cl, p["url"])
+        if not groups:
+            raise ApiError(f"product {pid} has no selectable specs (got --spec {want!r})")
+        lw = want.lower().replace(" ", "")
+        norm = lambda v: (v or "").lower().replace(" ", "")  # noqa: E731
+        hits = [o for g in groups for o in g["options"] if norm(o["value"]) == lw] or \
+            [o for g in groups for o in g["options"] if lw in norm(o["value"])]
+        if len({o["id"] for o in hits}) > 1:
+            raise ApiError(f"--spec {want!r} matches several: " +
+                           ", ".join(f"{o['value']} ({o['id']})" for o in hits))
+        if not hits:
+            raise ApiError(f"no spec {want!r}; choices: " + "; ".join(
+                f"[{g['name']}] " + " / ".join(o["value"] for o in g["options"]) for g in groups))
+        if hits[0]["sold_out"]:
+            raise ApiError(f"spec {hits[0]['value']} (id {hits[0]['id']}) is sold out")
+        pid = hits[0]["id"]
+    return pid
+
+
+def cmd_cart(args):
+    with Client(args) as cl:
+        if not cl.st.get("cookies"):
+            raise Auth("not signed in - run `iherb login`")
+        if args.action == "list":
+            c = read_cart(cl)
+            return emit(ok(c), args.json, lambda: _cart_human(c))
+
+        if args.action == "add":
+            if not args.ref:
+                raise Usage("cart add needs a product id or URL")
+            if args.qty < 1:
+                raise Usage("--qty must be >= 1")
+            pid = product_id(args.ref)
+            if args.spec:
+                pid = pick_spec(cl, pid, args.spec)
+            p = get_products(cl, [pid]).get(pid)
+            if not p:
+                raise ApiError(f"no iHerb product {pid}")
+            if not p["in_stock"] or p["purchasable"] is False:
+                raise ApiError(f"{p['title']} ({pid}) is out of stock / not purchasable")
+            plan = {"id": pid, "title": p["title"], "quantity": args.qty, "price": p["price"],
+                    "estimate": (p["price"] or 0) * args.qty, "url": p["url"]}
+            desc = f"{args.qty}x {p['title']} ({pid}) {nt(p['price'])} each"
+            if not args.yes:
+                return emit(ok(dict(plan, dry_run=True)), args.json,
+                            f"would add to cart: {desc}. re-run with --yes")
+            before = {x["id"]: x["quantity"] for x in read_cart(cl)["lines"]}
+            cl.cart_api("POST", "/api/Carts/v3/catalog/lineItems", {
+                "lineItems": [{"productId": pid, "quantity": args.qty, "frequencyId": None}],
+                "sourceModule": "ProductDetailsPage", "referralCode": "", "promoCode": ""})
+            c = read_cart(cl)
+            line = next((x for x in c["lines"] if x["id"] == pid), None)
+            if not line or line["quantity"] <= before.get(pid, 0):
+                raise ApiError("iHerb accepted the add but the cart does not show it",
+                               {"cart": c["lines"]})
+            return emit(ok({"added": plan, "verified_line": line, "cart_count": c["count"],
+                            "cart_total": c["total"]}), args.json,
+                        f"added; cart now has #{line['line']} {line['quantity']}x {line['title']} "
+                        f"({line['unit_price_text']} each) - {c['count']} item(s), total {c['total']}")
+
+        c = read_cart(cl)
+        if not args.ref:
+            raise Usage(f"cart {args.action} needs a line number, product id or URL")
+        line = find_line(c, args.ref)
+        if args.action == "qty":
+            if args.n is None or args.n < 0:
+                raise Usage("cart qty <line> N  (N >= 1; use `cart rm` to delete)")
+            if args.n == 0:
+                raise Usage("use `cart rm` to delete a line")
+            if line["max_qty"] and args.n > line["max_qty"]:
+                raise ApiError(f"max quantity for this item is {line['max_qty']}")
+            if not args.yes:
+                return emit(ok({"dry_run": True, "line": line, "new_quantity": args.n}), args.json,
+                            f"would set #{line['line']} {line['title']} qty {line['quantity']} -> {args.n}. "
+                            "re-run with --yes")
+            cl.cart_api("PUT", "/api/Carts/v2/lineitem", {"productId": line["id"], "quantity": args.n})
+            c2 = read_cart(cl)
+            nl = next((x for x in c2["lines"] if x["id"] == line["id"]), None)
+            if not nl or nl["quantity"] != args.n:
+                raise ApiError("iHerb accepted the change but the cart shows "
+                               f"{nl['quantity'] if nl else 'no line'}", {"cart": c2["lines"]})
+            return emit(ok({"verified_line": nl, "cart_count": c2["count"], "cart_total": c2["total"]}),
+                        args.json, f"#{nl['line']} {nl['title']} now qty {nl['quantity']} "
+                                   f"({nl['subtotal_text'] or nt(nl['subtotal'])}); total {c2['total']}")
+        # rm
+        if not args.yes:
+            return emit(ok({"dry_run": True, "remove": line}), args.json,
+                        f"would remove #{line['line']} {line['quantity']}x {line['title']} ({line['id']}). "
+                        "re-run with --yes")
+        cl.cart_api("DELETE", "/api/Carts/v2/lineitems/products",
+                    {"lineItems": [line["id"]], "sourceModule": "CartLists"})
+        c2 = read_cart(cl)
+        if any(x["id"] == line["id"] for x in c2["lines"]):
+            raise ApiError("iHerb accepted the remove but the item is still in the cart")
+        return emit(ok({"removed": line, "cart_count": c2["count"], "cart_total": c2["total"]}),
+                    args.json, f"removed {line['title']} ({line['id']}); cart now "
+                               f"{c2['count']} item(s), total {c2['total']}")
+
+
+# ------------------------------------------------------------------ parser
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        as_json = "--json" in sys.argv
+        emit(err(f"{self.prog}: {message}", EX_USAGE), as_json)
+        if not as_json:
+            self.print_usage(sys.stderr)
+        sys.exit(EX_USAGE)
+
+
+def build_parser():
+    p = Parser(prog="iherb", description="iHerb Taiwan (tw.iherb.com) from the shell (no checkout).")
+    p.add_argument("--version", action="version", version=VERSION)
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--json", action="store_true", help="stable {ok, data|error} envelope")
+    common.add_argument("--debug", action="store_true", help="dump requests to stderr")
+    common.add_argument("--via", choices=["auto", "http", "browser"], default="auto",
+                        help="transport for anonymous reads: HTTP, CDP background tab, or "
+                             "HTTP with browser fallback (default)")
+    sub = p.add_subparsers(dest="cmd", required=True, parser_class=Parser)
+
+    sub.add_parser("doctor", parents=[common], help="transport, API reachability, login state"
+                   ).set_defaults(fn=cmd_doctor)
+
+    s = sub.add_parser("search", parents=[common], help="search products")
+    s.add_argument("query")
+    s.add_argument("--limit", type=int, default=20)
+    s.add_argument("--page", type=int, default=1)
+    s.add_argument("--sort", choices=list(SORTS))
+    s.add_argument("--min", type=float, help="min price TWD (filters this page)")
+    s.add_argument("--max", type=float, help="max price TWD (filters this page)")
+    s.add_argument("--in-stock", action="store_true")
+    s.set_defaults(fn=cmd_search)
+
+    pr = sub.add_parser("product", aliases=["item"], parents=[common],
+                        help="one product: price, promo, stock, rating, specs/variants")
+    pr.add_argument("product", help="product id or tw.iherb.com/pr/... URL")
+    pr.add_argument("--no-variants", action="store_true", help="skip the product page (variants)")
+    pr.set_defaults(fn=cmd_product)
+
+    pc = sub.add_parser("price", parents=[common], help="quick price check for many products")
+    pc.add_argument("products", nargs="+", help="ids or URLs")
+    pc.set_defaults(fn=cmd_price)
+
+    lg = sub.add_parser("login", parents=[common], help="save a signed-in iHerb session")
+    g = lg.add_mutually_exclusive_group()
+    g.add_argument("--from-browser", action="store_true",
+                   help="(default) copy the session from Edge on CDP; opens the sign-in page if needed")
+    g.add_argument("--from-clipboard", action="store_true", help="Cookie header from the clipboard")
+    g.add_argument("--cookie-stdin", action="store_true", help="paste/pipe a Cookie header")
+    lg.add_argument("--cdp", help=f"CDP endpoint (default {CDP})")
+    lg.add_argument("--wait", type=int, default=300, help="seconds to wait for you to sign in")
+    lg.add_argument("--keyring", action="store_true", help="store cookies in the OS keyring")
+    lg.set_defaults(fn=cmd_login)
+    sub.add_parser("logout", parents=[common], help="delete the saved session").set_defaults(fn=cmd_logout)
+    sub.add_parser("whoami", parents=[common], help="verify the saved session over HTTP"
+                   ).set_defaults(fn=cmd_whoami)
+
+    c = sub.add_parser("cart", parents=[common], help="cart list/add/rm/qty (needs login; no checkout)")
+    c.add_argument("action", choices=["list", "add", "rm", "qty"])
+    c.add_argument("ref", nargs="?", help="add: id/URL; rm/qty: line #, id or URL")
+    c.add_argument("n", nargs="?", type=int, help="qty: new quantity")
+    c.add_argument("--qty", type=int, default=1, help="add: quantity")
+    c.add_argument("--spec", "--opt", action="append", help="add: variant text, e.g. '240 入' (repeatable)")
+    c.add_argument("--yes", action="store_true", help="really write; without it only preview")
+    c.set_defaults(fn=cmd_cart)
+
+    r = sub.add_parser("raw", parents=[common], help="GET passthrough for debugging (JSON out)")
+    r.add_argument("path", help="tw.iherb.com path or full iHerb API URL")
+    r.set_defaults(fn=cmd_raw)
+    return p
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    try:
+        return args.fn(args)
+    except Auth as e:
+        return emit(err(str(e), EX_AUTH), args.json)
+    except Net as e:
+        return emit(err(str(e), EX_NET), args.json)
+    except Usage as e:
+        return emit(err(str(e), EX_USAGE), args.json)
+    except ApiError as e:
+        return emit(err(str(e), EX_ERR, **(e.detail or {})), args.json)
+    except BrokenPipeError:
+        return EX_OK
+    except KeyboardInterrupt:
+        return EX_ERR
+
+
+if __name__ == "__main__":
+    sys.exit(main())
