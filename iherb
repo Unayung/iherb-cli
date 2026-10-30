@@ -345,8 +345,20 @@ class Browser:
         return r["http"], r["text"]
 
     def close(self):
+        # Edge quits (clean exit) if the background tab we close is the
+        # last "page" target left - guard: if ours is the only page, leave
+        # it open (navigate to about:blank) instead of closing it.
         try:
-            self.b.call("Target.closeTarget", targetId=self.tid)
+            targets = self.b.call("Target.getTargets").get("targetInfos", [])
+            pages = [t for t in targets if t.get("type") == "page"]
+            only_page_left = len(pages) <= 1 and any(t.get("targetId") == self.tid for t in pages)
+        except Exception:
+            only_page_left = False
+        try:
+            if only_page_left:
+                self.p.call("Page.navigate", url="about:blank")
+            else:
+                self.b.call("Target.closeTarget", targetId=self.tid)
         except Exception:
             pass
         for w in (getattr(self, "p", None), getattr(self, "b", None)):
