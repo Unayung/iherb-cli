@@ -6,7 +6,7 @@ description: Use when searching iHerb Taiwan (tw.iherb.com) products, checking T
 # iherb — iHerb Taiwan from a shell (no checkout)
 
 `~/.local/bin/iherb` → `~/Projects/iherb-cli/iherb`. Stdlib Python over plain HTTPS. The Edge browser
-on CDP 9222 is only used for `login` and as a fallback when Cloudflare walls an anonymous read.
+on CDP 9222 is only used for the opt-in `login --from-browser` and as a fallback when Cloudflare walls an anonymous read.
 Start with `iherb doctor`.
 
 - `iherb search 魚油 --json [--sort price|price-desc|bestselling|rating|discount] [--min/--max TWD] [--page N]`
@@ -22,10 +22,13 @@ Start with `iherb doctor`.
   stock, rating, flags, shipping (free over NT$790), and `variants[]` (each spec row → options with
   product `id`). On iHerb a variant is a different product id.
 - `iherb price <id> <id>... --json` is for price monitoring (price, list_price, promo, in_stock, checked_at)
-- Login: `iherb login` copies the Edge session. If the user is not signed in, it opens the sign-in page
-  in a background tab and waits for the USER to sign in. Never ask for or type passwords/OTP.
-  `whoami` checks the saved session over HTTP (email, name). Exit 3 = run `iherb login` again (sessions
-  last about 2 weeks, and an expired `cf_clearance` also needs a fresh login).
+- Login: never ask for or type passwords/OTP, and never ask the user to paste cookies into chat. Tell
+  the user: DevTools > Network > click any iherb.com request > copy the `Cookie:` request header to the
+  clipboard, then run `iherb login` themselves (or pipe it in on stdin). No usable Cookie header = exit 2
+  with those steps. `login --from-browser` is opt-in only (Edge on CDP 9222; opens the sign-in page in a
+  background tab and waits for the USER). `whoami` checks the saved session over HTTP (email, name).
+  Exit 3 = run `iherb login` again (sessions last about 2 weeks, and an expired `cf_clearance` also
+  needs a fresh login).
 - Cart (needs login): `cart list`; `cart add <id> [--qty N] [--spec '240 入']`; `cart qty <line> N`;
   `cart rm <line|id>`. Run first WITHOUT `--yes` to get the dry run, show it to the user, and add
   `--yes` only after they agree. The CLI re-reads the cart after each write and reports the verified line.

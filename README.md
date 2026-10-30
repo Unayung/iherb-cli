@@ -20,13 +20,22 @@ own tabs are never focused or touched.
 
 ## Login (no password, ever)
 
+iHerb signs in with a password (+ OTP), so the CLI never takes credentials. It logs in with the
+`Cookie` request header of a browser session you already have:
+
+1. In your browser: DevTools > Network > click any request to `iherb.com` (e.g. `catalog.app.iherb.com`) > Request Headers.
+2. Copy the value of `Cookie:` (with or without the leading `Cookie: `).
+3. Run `iherb login`. It reads the clipboard, or stdin when piped.
+
 ```
-iherb login                      # = --from-browser: copies the session from Edge on CDP;
-                                 #   if you are not signed in it opens the iHerb sign-in page in a
-                                 #   background tab and waits (--wait 300) while you sign in there
-iherb login --from-clipboard     # copy DevTools' Cookie request header first
+iherb login                      # Cookie header from stdin (piped) or the clipboard;
+                                 #   nothing usable there = exit 2 with these steps
+iherb login --from-clipboard     # clipboard only
 iherb login --cookie-stdin       # paste or pipe it (raw tty, >4 KB is fine)
 iherb login --keyring            # store it in the OS keyring instead of the file
+iherb login --from-browser       # opt-in: copy the session from Edge on CDP 9222; if you are not
+                                 #   signed in it opens the sign-in page in a background tab
+                                 #   and waits (--wait 300) while you sign in there
 iherb whoami | logout
 ```
 
@@ -35,7 +44,11 @@ Before saving, the session is checked over plain HTTP with `currentUser`. It is 
 (`secret-tool`/`security`, chunked because `secret-tool` returns at most 8 KB). `IHERB_COOKIE`
 overrides both. The Edge User-Agent is saved too, because Cloudflare's `cf_clearance` is bound to it.
 `whoami` and the cart use only this saved session; they never borrow the browser. The session lasts
-about 2 weeks (`expires` in `whoami`).
+about 2 weeks (`expires` in `whoami`). Exit 3 means there is no valid session (or it expired): log in
+again.
+
+Edge on CDP 9222 is needed only for `login --from-browser`, and as the fallback when Cloudflare walls an
+anonymous read (variants without a saved session).
 
 ## Read
 

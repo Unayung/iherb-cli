@@ -55,8 +55,11 @@ Captured from Edge's own traffic (CDP Network domain, background tab).
 Lightpanda 1.0.2 `fetch` renders the product page too, but in English (no
 locale), so it is not used. Never called: /checkout, /api/checkout*, orders.
 
-Login: never passwords/OTP. `iherb login` (default --from-browser) reads the
-cookies of the Edge on IHERB_CDP; if not signed in it opens the iHerb sign-in
+Login: never passwords/OTP. `iherb login` takes a DevTools `Cookie:` request header:
+from stdin when piped, else from the clipboard (exit 2 + instructions if the
+clipboard holds no iHerb Cookie header). Also --from-clipboard / --cookie-stdin.
+`iherb login --from-browser` (opt-in) reads the cookies of the Edge on
+IHERB_CDP; if not signed in it opens the iHerb sign-in
 page in a background tab and polls until you sign in there. The session is
 verified with currentUser over plain HTTP before it is saved to
 ~/.config/iherb/state.json (0600) or the OS keyring (--keyring; chunked, since
@@ -1000,14 +1003,27 @@ def login_from_browser(args):
         br.close()
 
 
+LOGIN_HOWTO = ("no iHerb Cookie header found. In the browser: DevTools > Network > click any "
+               "request to iherb.com > Request Headers > copy the `Cookie:` value, "
+               "then run `iherb login` again (or pipe it in)")
+
+
 def cmd_login(args):
-    if args.from_clipboard or args.cookie_stdin:
-        raw = _clipboard() if args.from_clipboard else \
-            (_read_cookie_tty() if sys.stdin.isatty() else sys.stdin.read())
+    default = not (args.from_clipboard or args.cookie_stdin or args.from_browser)
+    if default:
+        try:
+            raw = _clipboard() if sys.stdin.isatty() else sys.stdin.read()
+            clean_cookie(raw)
+        except Auth:
+            raise Usage(LOGIN_HOWTO)
+    if args.from_clipboard or args.cookie_stdin or default:
+        if not default:
+            raw = _clipboard() if args.from_clipboard else \
+                (_read_cookie_tty() if sys.stdin.isatty() else sys.stdin.read())
         cookies = header_to_cookies(clean_cookie(raw))
         ua = os.environ.get("IHERB_UA") or DEFAULT_UA
         u, li = _verify(cookies, ua, args.debug)
-        src = "clipboard" if args.from_clipboard else "stdin"
+        src = "clipboard" if args.from_clipboard or (default and sys.stdin.isatty()) else "stdin"
     else:
         cookies, ua, (u, li) = login_from_browser(args)
         src = f"browser {CDP}"
@@ -1284,10 +1300,10 @@ def build_parser():
     pc.add_argument("products", nargs="+", help="ids or URLs")
     pc.set_defaults(fn=cmd_price)
 
-    lg = sub.add_parser("login", parents=[common], help="save a signed-in iHerb session")
+    lg = sub.add_parser("login", parents=[common], help="save a signed-in iHerb session (default: Cookie header from stdin or clipboard)")
     g = lg.add_mutually_exclusive_group()
     g.add_argument("--from-browser", action="store_true",
-                   help="(default) copy the session from Edge on CDP; opens the sign-in page if needed")
+                   help="(opt-in) copy the session from Edge on CDP; opens the sign-in page if needed")
     g.add_argument("--from-clipboard", action="store_true", help="Cookie header from the clipboard")
     g.add_argument("--cookie-stdin", action="store_true", help="paste/pipe a Cookie header")
     lg.add_argument("--cdp", help=f"CDP endpoint (default {CDP})")
