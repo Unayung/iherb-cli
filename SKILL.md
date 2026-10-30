@@ -38,3 +38,5 @@ Pitfalls: anonymous product HTML (`/pr/...`) gets Cloudflare 403. Variants then 
 background Edge tab, or are skipped with `--no-variants`. Repeated cookieless GraphQL calls sometimes
 get a CF challenge; the CLI waits 3 s and retries once. The cart line price already includes the
 public promo code (e.g. NT$207 → NT$166).
+
+CDP setup: if `iherb doctor` shows `cdp` failing and a command needs Edge, ask the user to start it as in README "Browser on CDP 9222" (separate `--user-data-dir`, `--remote-debugging-port=9222`). Never launch a browser yourself.
